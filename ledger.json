@@ -1,0 +1,27 @@
+[
+  {
+    "task_id": "KAVI-DEMO-001",
+    "owner": "ChatGPT",
+    "objective": "Reconcile the job application tracker",
+    "output": "ChatGPT executed task KAVI-DEMO-001. Objective: Reconcile the job application tracker. Deliverable: Tracker reconciliation summary delivered with source links.",
+    "recorded_at": "2026-10-25T00:20:24.115905+00:00",
+    "status": "COMPLETED_VERIFIED"
+  },
+  {
+    "task_id": "KAVI-DEMO-002",
+    "owner": "Hermes",
+    "objective": "Check scheduler health on the Hermes host",
+    "output": "Hermes executed task KAVI-DEMO-002. Objective: Check scheduler health on the Hermes host. Deliverable: Health report generated.",
+    "recorded_at": "2026-10-25T00:20:24.123935+00:00",
+    "status": "BLOCKED",
+    "reason": "DEFINITION_OF_DONE keywords missing from output: evidence, includes, metrics, restart, uptime"
+  },
+  {
+    "task_id": "KAVI-DEMO-003",
+    "owner": "Onur",
+    "status": "DECISION_NEEDED",
+    "objective": "Approve the Wave 2 diet package (98 unknown jobs)",
+    "reason": "lane 'decision': routed to a human decision, never executed",
+    "recorded_at": "2026-10-25T00:20:24.130095+00:00"
+  }
+]
