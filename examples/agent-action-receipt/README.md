@@ -1,44 +1,86 @@
-# Free Agent Action Receipt Gate
+# Free Agent Action Receipt Gate — Sender **and** Receiver
 
-**The problem:** an agent calls a tool to send a message/book a slot/charge a card. The tool performs the side effect, but the network times out before the agent sees the response. If the agent retries, it can perform the action twice.
+**The failure:** an AI agent calls a booking/SMS/payment tool. The operation succeeds, but its network acknowledgment is lost. Retrying with a new attempt can repeat the side effect. Merely **generating an idempotency key on the sender** does not guarantee anything: the **receiver must check and enforce** that key before committing the action.
 
-**The fix:** assign a stable business-event action ID, persist a `pending` receipt before the call, and treat every unknown outcome as **uncertain**, not as a safe retry. After confirmed success, save the provider result; the next identical invocation returns the saved result. If the process crashes or times out, independently reconcile against the provider before changing state.
+This free, dependency-free Python 3.10+ example has **two deliberately separate layers**:
 
-This minimal **Python 3.10+ / zero-dependency** educational sample uses one local SQLite database. It does **not** promise exactly-once remote execution. It blocks repeat calls that use the same receipt database and stable action ID. If the database is lost, the operator changes the ID, or another host uses a different database, duplication is still possible. For production/multi-worker systems use a shared transactional store or durable workflow and, whenever supported, pass the *same provider-side idempotency key* on retries.
+| Layer | File | What it guarantees (within its scope) |
+| --- | --- | --- |
+| Sender | `agent_action_receipt.py` | A durable local `pending` receipt prevents a **second local attempt** for the same stable business action. Unknown outcomes remain blocked until independently reconciled. |
+| Receiver | `booking_receiver.py` | An atomic SQLite transaction **checks the incoming key first**, inserts a booking, and persists its cached response together. Matching retries return that response; mismatched payloads are rejected. |
 
-## Try it
+The receiver also enforces `UNIQUE(slot)` to prevent a different key from silently taking the same slot. In this sample, a **booking is a row in the receiver's SQLite database**, not a call to an external scheduling provider.
+
+## Run all tests
+
+From this directory:
 
 ```bash
-python3 -m unittest -v test_agent_action_receipt.py
+python3 -m unittest -v test_agent_action_receipt.py test_booking_receiver.py
 ```
 
-## Drop-in example
+The tests cover: sender deduplication; payload mismatch; pending-timeout safety; concurrent sender calls; receiver deduplication; receiver payload mismatch; occupied slots with different keys; six simultaneous receiver calls; rollback when receipt persistence fails; and reconciliation after a **lost acknowledgment**.
+
+## Receiver-side enforcement (the missing piece)
 
 ```python
-from agent_action_receipt import run_once, UncertainOutcome
+from booking_receiver import book_slot, lookup_booking_by_key
 
-# This ID comes from your durable lead/event record, not from the model.
-lead_event_id = "lead42-inbound-first-response"
-payload = {"lead_id": "lead42", "message": "Thanks for calling!"}
+# Imagine this function sits behind an authenticated POST /bookings endpoint.
+# The HTTP handler extracts an idempotency key from the request header.
+key = "tenant7:lead42:first-appointment"  # stable across retries
+result = book_slot("receiver.sqlite3", key, "customer-42", "2026-11-10T10:00")
+print(result)
 
-def send_sms():
-    # Replace with provider call; pass lead_event_id as provider idempotency key
-    # if the provider supports one.
-    return {"provider_message_id": "sms_123"}
+# A duplicate request with the SAME key + SAME payload returns the SAME booking.
+assert book_slot("receiver.sqlite3", key, "customer-42", "2026-11-10T10:00") == result
 
-try:
-    receipt = run_once("receipts.sqlite3", lead_event_id, payload, send_sms)
-    print(receipt)
-except UncertainOutcome:
-    print("STOP. Query provider/event ledger; do not blindly retry.")
+# After a timeout, query the authoritative receiver rather than guessing.
+assert lookup_booking_by_key("receiver.sqlite3", key, "customer-42", "2026-11-10T10:00") == result
 ```
 
-Three important distinctions:
+`book_slot(...)` performs these steps inside **one `BEGIN IMMEDIATE` transaction**:
 
-1. `pending` does not mean failure. It means **the outcome is not known** (or a first call is in flight).
-2. A manual `reconcile_confirmed(...)` is allowed only after a provider query proves the effect happened. If it did not happen, a production adapter must have an explicit, audited resolution policy. **Don't just delete the pending row to force a retry.**
-3. For external payments and high-impact actions, prefer provider-native idempotency and authoritative lookup. SQLite is only the local teaching example, not an infrastructure-wide guarantee.
+1. Look up the incoming key in `booking_receipts` **before** any booking insert.
+2. Return its cached response if the payload fingerprint matches; otherwise raise `IdempotencyConflict` (HTTP **409** in an API wrapper).
+3. If the key is new, insert the booking (with `UNIQUE(slot)` to prevent slot collisions), persist the key/fingerprint/result receipt, **then** commit both writes together. An occupied slot raises `SlotUnavailable` (also usually HTTP **409**).
+4. If anything fails before commit, the transaction rolls back **both** writes. Two concurrent requests sharing this SQLite database cannot pass the check-and-act gate separately.
 
-**Reproducible checks:** deduplication after success, payload drift detection, ambiguous-timeout lockout with reconciliation, and two concurrent callers racing for the same ID.
+In a real HTTP service, the server must enforce the key in its **own durable store**. A client-provided key is not a security credential: authenticate the caller, scope keys to a tenant/business operation, validate booking payloads and apply appropriate retention policies.
 
-Background: Temporal documents at-least-once activity execution and idempotency. AWS Durable Execution documents at-most-once versus at-least-once retry semantics. This is a deliberately smaller self-contained pattern, not a replacement for those systems.
+## Combining the sender with the receiver
+
+```python
+from agent_action_receipt import run_once, reconcile_confirmed, UncertainOutcome
+from booking_receiver import book_slot, lookup_booking_by_key
+
+key = "tenant7:lead42:first-appointment"
+payload = {"customer_id": "customer-42", "slot": "2026-11-10T10:00"}
+sender_db = "sender.sqlite3"
+receiver_db = "receiver.sqlite3"
+
+def send_booking():
+    # Real implementation sends key + payload to the provider/receiver.
+    return book_slot(receiver_db, key, payload["customer_id"], payload["slot"])
+
+try:
+    result = run_once(sender_db, key, payload, send_booking)
+except UncertainOutcome:
+    # Do not blindly retry if sender state is still pending.
+    verified = lookup_booking_by_key(receiver_db, key, **payload)
+    if verified is None:
+        raise  # Unresolved is NOT proof that another attempt is safe.
+    reconcile_confirmed(sender_db, key, payload, verified)
+    result = verified
+```
+
+If the receiver commits but the network response is lost, the **sender remains `pending`**; querying the receiver can establish a confirmed result. `test_lost_ack_uses_receiver_lookup_to_reconcile_caller` exercises this exact sequence.
+
+## Important limitations — not "exactly once" across services
+
+- The receiver demonstration is atomic **only because the booking record and its receipt live in the same SQLite transaction/database**. It does not turn an external calendar API, SMS provider or payment service into an atomic participant. For those, use **provider-enforced idempotency**, an authoritative status lookup, and/or an outbox + reconciliation workflow appropriate to the provider's guarantees.
+- The sender demonstration requires the **same durable receipt database and stable action ID** on every attempt. Other hosts using different local databases, destroyed state or a freshly generated key can still duplicate work.
+- `pending` means *unknown or in flight*, **not failed**. An absent receipt on a remote lookup is not necessarily conclusive (e.g. stale replicas, delayed processing). Do not clear it or auto-retry without a proven resolution policy.
+- Idempotency has a scope and retention period; key reuse with changed arguments must fail. Receiver-side enforcement, isolation, and durable storage are mandatory for any useful guarantee.
+
+This is a teaching example for engineering discussions, not a production booking/payment API. Its purpose is to show the **boundary between creating a key and enforcing one**.
